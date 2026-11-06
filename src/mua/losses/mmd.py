@@ -1,43 +1,21 @@
-from typing import List
+from typing import Sequence
 
 import jax.numpy as jnp
 
-from ..utils import cdist, gaussian_kernel
+from ..utils import gaussian_kernel, sq_cdist
 
 
-def mmd(x: jnp.ndarray, y: jnp.ndarray, p_sigma: List[float]) -> jnp.ndarray:
-    """
-    Compute the Maximum Mean Discrepancy (MMD) between two sets of samples.
+def mmd(x: jnp.ndarray, y: jnp.ndarray, bandwidths: Sequence[float]) -> jnp.ndarray:
+    """Biased MMD^2 estimate with a Gaussian kernel, averaged over several bandwidths.
 
     Parameters
     ----------
-    x : jnp.ndarray
-        First set of samples.
-    y : jnp.ndarray
-        Second set of samples.
-    p_sigma : List[float]
-        List of bandwidths for the Gaussian kernel.
-
-    Returns
-    -------
-    jnp.ndarray
-        The MMD value.
+    x, y : (n, d), (m, d) samples.
+    bandwidths : kernel widths h (same units as the data), k(a, b) = exp(-|a-b|^2 / (2 h^2)).
     """
-    # Compute squared pairwise distances for both sets
-    XX = cdist(x, x + 1e-6) ** 2  # Add small epsilon to avoid zero distance
-    YY = cdist(y, y) ** 2
-    XY = cdist(x, y) ** 2
-
-    # Compute the sum of Gaussian kernels over multiple bandwidths
-    kernels = jnp.array([
-        gaussian_kernel(XX, sigma).mean() +
-        gaussian_kernel(YY, sigma).mean() -
-        2 * gaussian_kernel(XY, sigma).mean()
-        for sigma in p_sigma
-    ])
-
-    # Average the MMD values across all bandwidths
-    return jnp.mean(kernels)
-
-    # Average the MMD values across all bandwidths
-    return jnp.mean(kernels)
+    XX, YY, XY = sq_cdist(x, x), sq_cdist(y, y), sq_cdist(x, y)
+    return jnp.mean(jnp.stack([
+        gaussian_kernel(XX, h).mean() + gaussian_kernel(YY, h).mean()
+        - 2 * gaussian_kernel(XY, h).mean()
+        for h in bandwidths
+    ]))

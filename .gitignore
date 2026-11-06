@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Study outputs (scripts/), copied to the thesis with scripts/export.py
+results/

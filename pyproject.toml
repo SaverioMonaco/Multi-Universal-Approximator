@@ -1,17 +1,18 @@
 [project]
 name = "Multi-Universal-Approximator"
 version = "1.0.0"
-description = "Add your description here"
+description = "Entanglement-free multi universal approximator: classically simulable quantum generative models"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.14.0",
     "ipykernel>=6.29.5",
-    "jax==0.4.26",
-    "jaxlib==0.4.26",
+    "jax>=0.4.26",
+    "jaxlib>=0.4.26",
     "matplotlib>=3.10.3",
-    "optax==0.2.2",
-    "pennylane==0.35.1",
+    "optax>=0.2.2",
+    "pennylane>=0.35.1",
+    "scipy>=1.11",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.7.0",
     "tqdm>=4.67.1",

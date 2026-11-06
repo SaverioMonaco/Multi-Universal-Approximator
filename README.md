@@ -18,6 +18,10 @@ pip install -e .
 ```
 ## Examples
 
+The circuit is simulated exactly as a 2-component state vector in JAX
+(`mua.unitaries.Uuat.Uuat`); the PennyLane QNode `Uuat_qml` gives the same result
+(`tests/test_backend.py`) and is only used for drawings.
+
 ### Fitting a 1D Function
 You can approximate any function $f: [-1, 1] \to [-1, 1]$.
 
@@ -26,18 +30,14 @@ from mua.train import regression
 from mua.plots.fit import show
 import numpy as np
 
-depth = 5 # Number of iterations of the UAT ansatz
-
-num_epochs = 150
-lr = 0.1
-
 def tanh(x):
     return np.tanh(5 * x)
 
-# Training
-params, params_history, loss_history = regression.train(tanh, depth, num_epochs, lr)
+# depth 5 (layers of the UAT ansatz), 150 epochs, learning rate 0.1
+params, history = regression.train(tanh, depth=5, num_epochs=150, lr=0.1, seed=42)
+# history["f"][k], history["phi"][k], ...: prediction and parameters after k epochs
 
-show(tanh, params) # To show the predicted and target lines
+show(tanh, params)  # predicted and target lines
 ```
 
 ![Approximation plot](notebooks/examples/fits/fit1.png)
@@ -45,27 +45,39 @@ show(tanh, params) # To show the predicted and target lines
 ### Generation
 ```python
 from mua.train import gen
+import numpy as np
 
-depth      = ... # Number of iterations of the Multi UAT
-num_epochs = ... # Number of epochs
-num_imgs   = ... # Number of images to generate at each training step for the MMD
-lr         = ... # Learning rate
-dataset    = ... # Must be a list of vectors of values between -1 and 1
+data = ...  # (num_samples, num_qubits) training vectors in [-1, 1], see mua.scalers
 
-params, params_history, loss_history, fake_flattendigits = gen.train(
-    dataset
-    depth, 
-    num_epochs, 
-    num_imgs, 
-    lr, 
-    generate=10, 
-    frequency=10
+params, history = gen.train(
+    data,
+    depth=8,          # layers per qubit = dimension of the shared noise
+    num_epochs=50,    # passes over the data, one Adam step per batch
+    batch_size=2000,  # samples per MMD estimate
+    lr=5e-3,
+    w_scale=1.0,      # w ~ w_scale U[0,1); use ~1/depth for deep circuits
+    test_data=...,    # held-out vectors for the per-epoch MMD / correlation distance
+    seed=42,
 )
+fake = gen.generate(params, 1000, np.random.default_rng(0))
 ```
 
 ![Generation plot](notebooks/examples/generations/fake_images.png)
 
-See the folder `notebooks/examples` for clearer examples
+### Studies (`scripts/`)
+The studies of the thesis are scripts writing JSON to `results/` (gitignored):
+
+```bash
+python scripts/fit.py                         # 4 regressions -> results/fits/
+python scripts/gen.py --preset clic_q8_d8     # CLIC 8 px     -> results/clic/
+python scripts/gen.py --preset clic_q25_d22   # CLIC 25 px
+sbatch scripts/sbatch_gen.sh --preset mnist_d16   # full MNIST (784 qubits), Slurm
+sbatch scripts/sbatch_gen.sh --preset mnist_d32
+python scripts/export.py --dest DIR           # copy the JSON elsewhere (or MUA_EXPORT_DIR)
+```
+`scripts/run_all.sh` runs everything. Data paths: `MUA_CLIC_DIR` (folder with
+`clic_<n>px_{train,test}.h5`, from [desyqml/clic](https://doi.org/10.5281/zenodo.16027525)) and
+`MUA_MNIST` (`mnist.npz`), see `mua.data`.
 
 ## Sources
 

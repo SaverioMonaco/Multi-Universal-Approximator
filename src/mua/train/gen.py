@@ -1,154 +1,139 @@
-# train_mmd.py
-from pathlib import Path
-from typing import Callable, Dict
+"""Generative training of the multi universal approximator with an MMD loss.
 
+One qubit per feature; the noise z ~ U[0, 1)^depth is shared by all qubits and re-uploaded
+in every layer (w_{q,i} . z + alpha_{q,i}), so the noise dimension equals the depth."""
+import time
+
+import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import tqdm
-from jax import jit, value_and_grad, vmap
 
-from ..losses import mmd
-from ..unitaries.multiUuat import multi_Uuat
-from ..utils import COLORS, median_dist
-
-jv_multi_Uuat = jit(vmap(multi_Uuat, in_axes=(0, None, None, None)))
+from ..losses import corr, mmd
+from ..unitaries.multiUuat import batch_multi_Uuat
+from ..utils import median_dist
 
 
-def random_noise(num_vecs: int, num_qubits: int) -> jnp.ndarray:
-    """Uniform noise ∈ [0, 1). Shape = (num_vecs, num_qubits)."""
-    return jnp.array(np.random.rand(num_vecs, num_qubits))
+def random_noise(num_vecs: int, depth: int, rng: np.random.Generator) -> jnp.ndarray:
+    """Uniform noise in [0, 1), shape (num_vecs, depth)."""
+    return jnp.array(rng.random((num_vecs, depth)))
 
 
-def train(
-    pp_Y: jnp.ndarray,
-    depth: int,
-    num_epochs: int = 200,
-    num_imgs: int = 64,
-    lr: float = 1e-1,
-    p_sigma: list[float] | None = None,
-    generate: int = 0,
-    frequency: int = 1,
-    save: str | Path = "",
-    other_metrics: list[Callable] = [],
-):
+def init_params(num_qubits: int, depth: int, w_scale: float = 1.0,
+                rng: np.random.Generator | None = None) -> dict:
+    """phi, alpha ~ U[0, 1); w ~ w_scale * U[0, 1).
+
+    With w ~ U[0, 1) the re-uploading angle w . z grows like depth / 4: for deep circuits the
+    output oscillates quickly with z and the MMD gradients average out (a barren plateau in
+    the noise); w_scale ~ 1 / depth keeps the angles O(1)."""
+    rng = rng or np.random.default_rng()
+    return {"phi": jnp.array(rng.random((num_qubits, depth))),
+            "w": jnp.array(w_scale * rng.random((num_qubits, depth, depth))),
+            "alpha": jnp.array(rng.random((num_qubits, depth)))}
+
+
+_generate = jax.jit(lambda p, z: batch_multi_Uuat(z, p["phi"], p["w"], p["alpha"]))
+
+
+def generate(params: dict, num: int, rng: np.random.Generator, chunk: int = 2000) -> np.ndarray:
+    """`num` samples of <Z>, shape (num, num_qubits)."""
+    depth = params["phi"].shape[1]
+    out = [np.asarray(_generate(params, random_noise(min(chunk, num - i), depth, rng)))
+           for i in range(0, num, chunk)]
+    return np.concatenate(out)
+
+
+def train(data: np.ndarray, depth: int, num_epochs: int = 20, batch_size: int = 1000,
+          lr: float = 1e-2, bandwidth_factors=(0.25, 0.5, 1.0, 2.0, 4.0),
+          bandwidths=None, w_scale: float = 1.0, test_data: np.ndarray | None = None,
+          eval_size: int = 1000, seed: int | None = None, progress_bar: bool = True,
+          schedule: str = "constant", max_time: float | None = None, callback=None,
+          callback_every: int = 50):
     """
     Parameters
     ----------
-    pp_Y         : (num_samples, num_qubits) numpy array of real data vectors.
-    depth        : circuit depth.
-    num_epochs   : how many full dataset passes to train.
-    num_imgs   : mini-batch size (last batch is dropped if smaller to
-                   keep shapes static for JIT).
-    lr           : Adam learning rate.
-    p_sigma      : bandwidth list for the MMD kernel.  If None → median rule.
-    generate     : if >0, generate this many fake samples with final model.
-    frequency    : evaluate `other_metrics` every `frequency` epochs.
-    save         : directory where loss curve PDF is written.
-    other_metrics: list of callables metric(fake, real) → float.
+    data : (N, Q) training vectors in [-1, 1] (already encoded).
+    depth : layers per qubit (= noise dimension).
+    num_epochs : passes over the training set; one Adam step per batch of `batch_size`
+        (the last incomplete batch is dropped, to keep shapes static for jit).
+    bandwidths : kernel widths h of the MMD; default `bandwidth_factors` x the median
+        pairwise distance of the training data.
+    test_data : (M, Q) held-out vectors; MMD and correlation distance are evaluated on
+        `eval_size` of them with fixed noise after every epoch (default: training data).
+    schedule : "constant" or "cosine" (cosine decay from `lr` to `lr` / 100 over all steps).
+    max_time : stop after the first epoch that ends past `max_time` seconds (wall clock).
+    callback : callback(params, history), called every `callback_every` epochs (checkpoints).
+
+    Returns
+    -------
+    params : dict phi (Q, D), w (Q, D, D), alpha (Q, D)
+    history : dict
+        step_loss (MMD of every training batch), epoch, mmd, corr (held-out, every epoch,
+        epoch 0 = initialisation), bandwidths, time
     """
-    save = Path(save)
-    save.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    data = np.asarray(data)
+    num_samples, num_qubits = data.shape
+    num_batches = num_samples // batch_size
 
-    # ---------------------------- data stats --------------------------
-    num_samples, num_qubits = pp_Y.shape
-    num_batches = num_samples // num_imgs  # drop remainder for shape stability
+    if bandwidths is None:
+        h = median_dist(data, 1000, seed=seed)
+        bandwidths = [k * h for k in bandwidth_factors]
+    bandwidths = [float(b) for b in bandwidths]
 
-    # ------------------------ model parameters ------------------------
-    key_shape = (num_qubits, depth)
-    pp_phi = jnp.array(np.random.rand(*key_shape))
-    ppp_omega = jnp.array(np.random.rand(num_qubits, depth, depth))
-    pp_alpha = jnp.array(np.random.rand(*key_shape))
-
-    params = (pp_phi, ppp_omega, pp_alpha)
-
-    # ---------------------------- optimiser --------------------------
+    params = init_params(num_qubits, depth, w_scale, rng)
+    if schedule == "cosine":
+        lr = optax.cosine_decay_schedule(lr, num_epochs * num_batches, alpha=0.01)
+    elif schedule != "constant":
+        raise ValueError(f"unknown schedule {schedule!r}")
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params)
 
-    # ------------------------ kernel bandwidth -----------------------
-    if p_sigma is None:
-        sigma = median_dist(pp_Y, 1000)
-        p_sigma = [k * sigma for k in [0.1, 0.5, 1, 2, 5, 10]]
+    def loss_fn(p, z, y):
+        return mmd(batch_multi_Uuat(z, p["phi"], p["w"], p["alpha"]), y, bandwidths)
 
-    # ------------------------- loss function -------------------------
-    def loss_fn(params, x, y_target, p_sigma):
-        pp_phi, ppp_omega, pp_alpha = params
-        y_fake = jv_multi_Uuat(x, pp_phi, ppp_omega, pp_alpha)
-        loss_val = mmd(y_fake, y_target, p_sigma)
-        return loss_val, y_fake
+    @jax.jit
+    def step(p, s, z, y):
+        loss, g = jax.value_and_grad(loss_fn)(p, z, y)
+        u, s = optimizer.update(g, s)
+        return optax.apply_updates(p, u), s, loss
 
-    @jit
-    def train_step(params, opt_state, x, y_target, p_sigma):
-        (loss_val, aux), grads = value_and_grad(loss_fn, has_aux=True)(
-            params, x, y_target, p_sigma
-        )
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss_val, aux  # aux == fake_y
+    ref = np.asarray(test_data if test_data is not None else data)
+    ref = ref[rng.choice(len(ref), min(eval_size, len(ref)), replace=False)]
+    keep = np.flatnonzero(ref.std(0) > 0)
+    z_eval = random_noise(len(ref), depth, rng)
+    mmd_eval = jax.jit(lambda a: mmd(a, jnp.array(ref), bandwidths))
 
-    # --------------------------- bookkeeping -------------------------
-    loss_history: list[float] = []
-    params_history: list[tuple] = []
+    history = {"step_loss": [], "epoch": [], "mmd": [], "corr": [], "time": [],
+               "bandwidths": bandwidths}
+    t0 = time.time()
 
-    metrics: Dict[str, Dict] = {
-        m.__name__: {"epoch": [], "value": []} for m in other_metrics
-    }
+    def log(epoch, p):
+        fake = _generate(p, z_eval)
+        history["epoch"].append(epoch)
+        history["mmd"].append(float(mmd_eval(fake)))
+        history["corr"].append(corr(np.asarray(fake), ref, keep))
+        history["time"].append(time.time() - t0)
 
-    progress = tqdm.tqdm(range(num_epochs), desc="Training", ncols=90)
-
-    for epoch in progress:
-        # shuffle once per epoch
-        perm = np.random.permutation(num_samples)
-        epoch_loss = 0.0
-
+    log(0, params)
+    bar = tqdm.trange(1, num_epochs + 1, disable=not progress_bar, ncols=100)
+    for epoch in bar:
+        perm = rng.permutation(num_samples)
         for b in range(num_batches):
-            idx = perm[b * num_imgs : (b + 1) * num_imgs]
-            Y_batch = jnp.array(pp_Y[idx])
-            X_batch = random_noise(num_imgs, depth)
-
-            params, opt_state, loss_val, fake_y = train_step(
-                params, opt_state, X_batch, Y_batch, p_sigma
-            )
-            epoch_loss += float(loss_val) * num_imgs  # accumulate
-
-        epoch_loss /= num_samples
-        loss_history.append(epoch_loss)
-        params_history.append(params)
-
-        # auxiliary metrics
-        if (epoch % frequency) == 0:
-            for m in other_metrics:
-                val = float(m(fake_y, Y_batch))
-                metrics[m.__name__]["epoch"].append(epoch)
-                metrics[m.__name__]["value"].append(val)
-
-        desc = f"MMD={epoch_loss:.6f}"
-        for m in other_metrics:
-            desc += f", {m.__name__}={metrics[m.__name__]['value'][-1]:.6f}"
-        progress.set_description(desc)
-
-    generated = None
-    if generate:
-        X_gen = random_noise(generate, depth)
-        generated = jv_multi_Uuat(X_gen, *params)
-
-    plt.figure(figsize=(6, 3))
-    plt.xlabel("Epoch")
-    plt.ylabel("Losses")
-    plt.plot(loss_history, color=COLORS["mmd"], label="MMD")
-    for m in other_metrics:
-        plt.plot(
-            metrics[m.__name__]["epoch"],
-            metrics[m.__name__]["value"],
-            "--",
-            color=COLORS.get(m.__name__, "gray"),
-            label=m.__name__,
-        )
-    plt.legend()
-    plt.tight_layout()
-    if save:
-        plt.savefig(save / f"loss_clic_q{num_qubits}_d{depth}.pdf")
-
-    return params, params_history, loss_history, generated
+            y = jnp.array(data[perm[b * batch_size:(b + 1) * batch_size]])
+            z = random_noise(batch_size, depth, rng)
+            params, opt_state, loss = step(params, opt_state, z, y)
+            history["step_loss"].append(float(loss))
+        log(epoch, params)
+        bar.set_description(f"MMD {history['mmd'][-1]:.2e} corr {history['corr'][-1]:.2e}")
+        if not progress_bar:
+            print(f"epoch {epoch}/{num_epochs}: MMD {history['mmd'][-1]:.3e}, "
+                  f"corr {history['corr'][-1]:.3e} ({history['time'][-1]:.0f}s)", flush=True)
+        stop = max_time is not None and history["time"][-1] > max_time
+        if callback is not None and (epoch % callback_every == 0 or stop):
+            callback(params, history)
+        if stop:
+            print(f"time budget reached after epoch {epoch}", flush=True)
+            break
+    return params, history
