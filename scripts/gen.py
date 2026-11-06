@@ -25,9 +25,11 @@ PRESETS = {
     # full MNIST (784 qubits)
     "mnist_d16": dict(dataset="mnist", depth=16, epochs=40, batch=500, lr=5e-3, w_scale=0.1),
     "mnist_d32": dict(dataset="mnist", depth=32, epochs=60, batch=500, lr=3e-3, w_scale=0.05),
-    # weekend run (~100 s / epoch on allcpu): cosine decay, stops cleanly after 60 h
+    # long runs, cosine decay (GPU: ~1 s / epoch at depth 32 on a P100), stop cleanly after max_hours
     "mnist_d32_long": dict(dataset="mnist", depth=32, epochs=1800, batch=500, lr=3e-3,
                            w_scale=0.05, schedule="cosine", max_hours=60),
+    "mnist_d64_long": dict(dataset="mnist", depth=64, epochs=1800, batch=500, lr=2e-3,
+                           w_scale=0.025, schedule="cosine", max_hours=20),
 }
 
 

@@ -65,6 +65,9 @@ def train(data: np.ndarray, depth: int, num_epochs: int = 20, batch_size: int = 
     max_time : stop after the first epoch that ends past `max_time` seconds (wall clock).
     callback : callback(params, history), called every `callback_every` epochs (checkpoints).
 
+    The training noise and shuffling use jax.random (key from `seed`), the initialisation and
+    the evaluation noise numpy (`seed`).
+
     Returns
     -------
     params : dict phi (Q, D), w (Q, D, D), alpha (Q, D)
@@ -93,17 +96,34 @@ def train(data: np.ndarray, depth: int, num_epochs: int = 20, batch_size: int = 
     def loss_fn(p, z, y):
         return mmd(batch_multi_Uuat(z, p["phi"], p["w"], p["alpha"]), y, bandwidths)
 
+    # one compiled call per epoch: shuffle, draw the noise and run all Adam steps on the
+    # device (lax.scan over batches); the data is an argument, not a baked-in constant
     @jax.jit
-    def step(p, s, z, y):
-        loss, g = jax.value_and_grad(loss_fn)(p, z, y)
-        u, s = optimizer.update(g, s)
-        return optax.apply_updates(p, u), s, loss
+    def run_epoch(p, s, key, x):
+        k_perm, k_noise = jax.random.split(key)
+        idx = jax.random.permutation(k_perm, num_samples)[:num_batches * batch_size]
+        idx = idx.reshape(num_batches, batch_size)
+        zs = jax.random.uniform(k_noise, (num_batches, batch_size, depth), x.dtype)
+
+        def step(carry, a):
+            p, s = carry
+            i, z = a
+            loss, g = jax.value_and_grad(loss_fn)(p, z, x[i])
+            u, s = optimizer.update(g, s, p)
+            return (optax.apply_updates(p, u), s), loss
+
+        (p, s), losses = jax.lax.scan(step, (p, s), (idx, zs))
+        return p, s, losses
+
+    x_dev = jnp.asarray(data)
+    key = jax.random.PRNGKey(0 if seed is None else seed)
 
     ref = np.asarray(test_data if test_data is not None else data)
     ref = ref[rng.choice(len(ref), min(eval_size, len(ref)), replace=False)]
     keep = np.flatnonzero(ref.std(0) > 0)
     z_eval = random_noise(len(ref), depth, rng)
-    mmd_eval = jax.jit(lambda a: mmd(a, jnp.array(ref), bandwidths))
+    ref_dev = jnp.asarray(ref)
+    mmd_eval = jax.jit(lambda a, r: mmd(a, r, bandwidths))
 
     history = {"step_loss": [], "epoch": [], "mmd": [], "corr": [], "time": [],
                "bandwidths": bandwidths}
@@ -112,19 +132,16 @@ def train(data: np.ndarray, depth: int, num_epochs: int = 20, batch_size: int = 
     def log(epoch, p):
         fake = _generate(p, z_eval)
         history["epoch"].append(epoch)
-        history["mmd"].append(float(mmd_eval(fake)))
+        history["mmd"].append(float(mmd_eval(fake, ref_dev)))
         history["corr"].append(corr(np.asarray(fake), ref, keep))
         history["time"].append(time.time() - t0)
 
     log(0, params)
     bar = tqdm.trange(1, num_epochs + 1, disable=not progress_bar, ncols=100)
     for epoch in bar:
-        perm = rng.permutation(num_samples)
-        for b in range(num_batches):
-            y = jnp.array(data[perm[b * batch_size:(b + 1) * batch_size]])
-            z = random_noise(batch_size, depth, rng)
-            params, opt_state, loss = step(params, opt_state, z, y)
-            history["step_loss"].append(float(loss))
+        key, k = jax.random.split(key)
+        params, opt_state, losses = run_epoch(params, opt_state, k, x_dev)
+        history["step_loss"].extend(np.asarray(losses).tolist())
         log(epoch, params)
         bar.set_description(f"MMD {history['mmd'][-1]:.2e} corr {history['corr'][-1]:.2e}")
         if not progress_bar:
