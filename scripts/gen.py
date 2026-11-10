@@ -30,6 +30,14 @@ PRESETS = {
                            w_scale=0.05, schedule="cosine", max_hours=60),
     "mnist_d64_long": dict(dataset="mnist", depth=64, epochs=1800, batch=500, lr=2e-3,
                            w_scale=0.025, schedule="cosine", max_hours=20),
+    # d64_long (1800 epochs, 70 min on a P100) was still improving at the end: ~14x longer,
+    # ~2.3 s / epoch -> ~16 h; max_hours stops it cleanly inside the 24 h Slurm limit
+    "mnist_d64_xlong": dict(dataset="mnist", depth=64, epochs=25000, batch=500, lr=2e-3,
+                            w_scale=0.025, schedule="cosine", max_hours=22),
+    # depth 128 (128 noise inputs): w_scale and lr scaled down with depth as above; expected
+    # ~2x slower per epoch than depth 64 -> ~19 h
+    "mnist_d128_xlong": dict(dataset="mnist", depth=128, epochs=15000, batch=500, lr=1.5e-3,
+                             w_scale=0.0125, schedule="cosine", max_hours=22),
 }
 
 
